@@ -266,48 +266,6 @@ Use `.env.example` as the environment template for:
 - Stripe keys for future paid checkout
 - Arweave / Bundlr-style anchoring
 
-## 🚂 Railway Deployment
-
-The repo is now set up for Railway using a root-level `Dockerfile` and `railway.json`.
-
-Recommended Railway setup:
-
-1. Create a new Railway project from the GitHub repo.
-2. Let Railway detect the `Dockerfile`.
-3. Set these required environment variables:
-   - `DATABASE_URL`
-   - `SUPABASE_URL`
-   - `SUPABASE_SERVICE_ROLE_KEY`
-   - `SUPABASE_BUCKET`
-   - `PUBLIC_APP_URL`
-   - `ADMIN_WALLETS`
-4. Optional environment variables:
-   - `ADMIN_CONSOLE_PATH`
-   - `RESEND_API_KEY`
-   - `RESEND_FROM_EMAIL`
-   - `TWILIO_ACCOUNT_SID`
-   - `TWILIO_AUTH_TOKEN`
-   - `TWILIO_FROM_NUMBER`
-   - `ARWEAVE_API_KEY`
-   - `ARWEAVE_ENDPOINT`
-   - `ARWEAVE_AUTO_ANCHOR`
-   - `BILLING_TRIAL_DAYS`
-   - `BILLING_PLAN_USD`
-   - `BILLING_ENFORCEMENT`
-
-Production domain layout:
-
-- `tidbitshare.com` → marketing landing page
-- `app.tidbitshare.com` → authenticated app
-
-Railway should be pointed at the GitHub repo deployment path, not a bucket/function model. This app needs a live Rust server, Supabase connectivity, and runtime auth/policy checks.
-
-Admin analytics notes:
-
-- `ADMIN_WALLETS` should be a comma-separated allowlist such as `evm:0xabc...,sol:YourSolAddress`.
-- `ADMIN_CONSOLE_PATH` defaults to `/ops`. Set it to an unlinked path if you want a less discoverable console URL.
-- The admin console itself is marked `noindex`, but access control is enforced by the admin wallet allowlist, not by path secrecy alone.
-
 ## CLI Examples
 
 ```bash
