@@ -6,6 +6,18 @@ const SESSION_TTL_SECONDS: i64 = 60 * 60 * 24;
 const NONCE_TTL_SECONDS: i64 = 60 * 15;
 const SESSION_ROTATE_AFTER_SECONDS: i64 = 60 * 60 * 12;
 
+fn normalize_wallet_for_chain(wallet: &str, chain: &str) -> String {
+    let trimmed = wallet.trim();
+    let normalized_chain = chain.trim().to_ascii_lowercase();
+    if matches!(normalized_chain.as_str(), "evm" | "ethereum" | "metamask")
+        || (normalized_chain.is_empty() && trimmed.starts_with("0x"))
+    {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WalletSession {
     pub session_id: String,
@@ -118,6 +130,7 @@ impl AuthState {
         let now = OffsetDateTime::now_utc();
         let expires_at = now + time::Duration::seconds(SESSION_TTL_SECONDS);
         let session_family_id = uuid::Uuid::new_v4();
+        let wallet = normalize_wallet_for_chain(&wallet, chain);
 
         crate::sqlx::query(
             r#"
@@ -172,7 +185,8 @@ impl AuthState {
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-        self.revoke_other_wallet_sessions(&wallet, &session_id).await?;
+        self.revoke_other_wallet_sessions(&wallet, &session_id)
+            .await?;
 
         Ok(WalletSession {
             session_id,
@@ -221,25 +235,32 @@ impl AuthState {
 
         let stored_device_id: Option<String> = row.get("device_id");
         if let Some(expected) = stored_device_id.as_deref() {
-            match presented_device_id.map(str::trim).filter(|value| !value.is_empty()) {
+            match presented_device_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
                 Some(presented) if presented == expected => {}
                 _ => return Ok(None),
             }
         }
 
+        let chain: String = row.get("chain");
+        let wallet = normalize_wallet_for_chain(&row.get::<String, _>("wallet"), &chain);
+
         crate::sqlx::query(
-            "update wallet_sessions set last_seen_at = to_timestamp($2) where session_id = $1",
+            "update wallet_sessions set last_seen_at = to_timestamp($2), wallet = $3 where session_id = $1",
         )
         .bind(session_id.trim())
         .bind(now)
+        .bind(&wallet)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
         Ok(Some(WalletSession {
             session_id: row.get("session_id"),
-            wallet: row.get("wallet"),
-            chain: row.get("chain"),
+            wallet,
+            chain,
             created_at: row.get("created_at"),
             expires_at: row.get("expires_at"),
             last_seen_at: now,
@@ -264,21 +285,27 @@ impl AuthState {
         wallet: &str,
         keep_session_id: &str,
     ) -> Result<u64, AppError> {
+        let wallet = normalize_wallet_for_chain(wallet, "");
+        let is_evm = wallet.starts_with("0x");
         let result = crate::sqlx::query(
             r#"
             update wallet_sessions
             set revoked_at = now(),
                 revoked_reason = 'superseded_by_new_login',
                 replaced_by_session_id = $3
-            where wallet = $1
+            where (
+                    ($4 = true and lower(wallet) = lower($1))
+                 or ($4 = false and wallet = $1)
+                  )
               and session_id <> $2
               and revoked_at is null
               and expires_at > now()
             "#,
         )
-        .bind(wallet.trim())
+        .bind(&wallet)
         .bind(keep_session_id.trim())
         .bind(keep_session_id.trim())
+        .bind(is_evm)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -291,6 +318,8 @@ impl AuthState {
         wallet: &str,
         limit: i64,
     ) -> Result<Vec<WalletSessionRecord>, AppError> {
+        let wallet = normalize_wallet_for_chain(wallet, "");
+        let is_evm = wallet.starts_with("0x");
         let rows = crate::sqlx::query(
             r#"
             select
@@ -307,12 +336,16 @@ impl AuthState {
                 user_agent,
                 ip_address
             from wallet_sessions
-            where wallet = $1
+            where (
+                    ($2 = true and lower(wallet) = lower($1))
+                 or ($2 = false and wallet = $1)
+                  )
             order by coalesce(last_seen_at, created_at) desc, created_at desc
-            limit $2
+            limit $3
             "#,
         )
-        .bind(wallet.trim())
+        .bind(&wallet)
+        .bind(is_evm)
         .bind(limit)
         .fetch_all(&self.db)
         .await
@@ -343,19 +376,25 @@ impl AuthState {
         target_session_id: &str,
         reason: &str,
     ) -> Result<bool, AppError> {
+        let wallet = normalize_wallet_for_chain(wallet, "");
+        let is_evm = wallet.starts_with("0x");
         let result = crate::sqlx::query(
             r#"
             update wallet_sessions
             set revoked_at = now(),
                 revoked_reason = coalesce(revoked_reason, $3)
-            where wallet = $1
+            where (
+                    ($4 = true and lower(wallet) = lower($1))
+                 or ($4 = false and wallet = $1)
+                  )
               and session_id = $2
               and revoked_at is null
             "#,
         )
-        .bind(wallet.trim())
+        .bind(&wallet)
         .bind(target_session_id.trim())
         .bind(reason.trim())
+        .bind(is_evm)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;

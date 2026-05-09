@@ -1789,11 +1789,21 @@ async fn load_server_mlkem_keypair(
     db: &PgPool,
     wallet: &str,
 ) -> Result<Option<MlKemKeypairFile>, AppError> {
-    let wallet = wallet.trim().to_lowercase();
+    let chain = infer_wallet_chain(wallet);
+    let wallet = normalize_wallet_for_chain(wallet, chain);
     let row = sqlx::query(
-        "select wallet, kem, pk_b64, sk_b64, sk_b64_enc, sk_nonce_b64 from wallet_mlkem_keys where wallet = $1",
+        r#"
+        select wallet, kem, pk_b64, sk_b64, sk_b64_enc, sk_nonce_b64
+        from wallet_mlkem_keys
+        where (
+                ($2 = 'evm' and lower(wallet) = lower($1))
+             or ($2 = 'sol' and wallet = $1)
+              )
+        limit 1
+        "#,
     )
     .bind(&wallet)
+    .bind(chain)
     .fetch_optional(db)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -1862,7 +1872,7 @@ async fn load_or_create_server_mlkem_keypair(
     db: &PgPool,
     owner_wallet: &str,
 ) -> Result<MlKemKeypairFile, AppError> {
-    let wallet = owner_wallet.trim().to_lowercase();
+    let wallet = normalize_wallet_for_chain(owner_wallet, infer_wallet_chain(owner_wallet));
     if wallet.is_empty() {
         return Err(AppError::BadRequest("wallet is empty".into()));
     }
@@ -2375,79 +2385,44 @@ async fn parse_document_multipart(
                 );
             }
             "label" => {
-                parsed.label = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| {
-                            multipart_error(&format!("Reading {context_prefix} label failed"), e)
-                        })?,
-                );
+                parsed.label = Some(field.text().await.map_err(|e| {
+                    multipart_error(&format!("Reading {context_prefix} label failed"), e)
+                })?);
             }
             "anchor_to_arweave" => {
-                parsed.anchor_to_arweave = bool_from_form_text(
-                    &field
-                        .text()
-                        .await
-                        .map_err(|e| {
-                            multipart_error(
-                                &format!("Reading {context_prefix} Arweave flag failed"),
-                                e,
-                            )
-                        })?,
-                );
+                parsed.anchor_to_arweave =
+                    bool_from_form_text(&field.text().await.map_err(|e| {
+                        multipart_error(&format!("Reading {context_prefix} Arweave flag failed"), e)
+                    })?);
             }
             "encryption_source" => {
-                parsed.encryption_source = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| {
-                            multipart_error(
-                                &format!("Reading {context_prefix} encryption mode failed"),
-                                e,
-                            )
-                        })?,
-                );
+                parsed.encryption_source = Some(field.text().await.map_err(|e| {
+                    multipart_error(
+                        &format!("Reading {context_prefix} encryption mode failed"),
+                        e,
+                    )
+                })?);
             }
             "change_summary" => {
-                parsed.change_summary = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| {
-                            multipart_error(
-                                &format!("Reading {context_prefix} change summary failed"),
-                                e,
-                            )
-                        })?,
-                );
+                parsed.change_summary = Some(field.text().await.map_err(|e| {
+                    multipart_error(
+                        &format!("Reading {context_prefix} change summary failed"),
+                        e,
+                    )
+                })?);
             }
             "editor_mode" => {
-                parsed.editor_mode = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| {
-                            multipart_error(
-                                &format!("Reading {context_prefix} editor mode failed"),
-                                e,
-                            )
-                        })?,
-                );
+                parsed.editor_mode = Some(field.text().await.map_err(|e| {
+                    multipart_error(&format!("Reading {context_prefix} editor mode failed"), e)
+                })?);
             }
             "before_hash_hex" => {
-                parsed.before_hash_hex = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| {
-                            multipart_error(
-                                &format!("Reading {context_prefix} before snapshot hash failed"),
-                                e,
-                            )
-                        })?,
-                );
+                parsed.before_hash_hex = Some(field.text().await.map_err(|e| {
+                    multipart_error(
+                        &format!("Reading {context_prefix} before snapshot hash failed"),
+                        e,
+                    )
+                })?);
             }
             _ => {}
         }
@@ -3015,12 +2990,13 @@ async fn create_document_record(
     parent_version: Option<i32>,
     anchor_to_arweave: bool,
 ) -> Result<CreatedDocumentRecord, AppError> {
+    let owner_wallet = normalize_wallet_for_chain(owner_wallet, infer_wallet_chain(owner_wallet));
     let hash_hex = hex::encode(pqc_sha3::sha3_256_bytes(bytes));
     let id = uuid::Uuid::new_v4();
     let version = parent_version.map(|value| value + 1).unwrap_or(1);
     let (stored_bytes, ciphertext_hash_hex) = build_document_envelope(
         &st.db,
-        owner_wallet,
+        &owner_wallet,
         id,
         label.as_deref(),
         &mime_type,
@@ -3029,7 +3005,7 @@ async fn create_document_record(
     .await?;
     persist_document_record(
         st,
-        owner_wallet,
+        &owner_wallet,
         id,
         version,
         hash_hex,
@@ -3060,11 +3036,22 @@ async fn persist_document_record(
     encryption_mode: &str,
     ciphertext_hash_hex: String,
 ) -> Result<CreatedDocumentRecord, AppError> {
+    let owner_wallet = normalize_wallet_for_chain(owner_wallet, infer_wallet_chain(owner_wallet));
     let existing = sqlx::query(
-        "select id from documents where owner_wallet = $1 and hash_hex = $2 and is_deleted = false",
+        r#"
+        select id
+        from documents
+        where (
+                ($3 = 'evm' and lower(owner_wallet) = lower($1))
+             or ($3 = 'sol' and owner_wallet = $1)
+              )
+          and hash_hex = $2
+          and is_deleted = false
+        "#,
     )
-    .bind(owner_wallet)
+    .bind(&owner_wallet)
     .bind(&hash_hex)
+    .bind(infer_wallet_chain(&owner_wallet))
     .fetch_optional(&st.db)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -3079,7 +3066,7 @@ async fn persist_document_record(
     let storage_path = st
         .storage
         .upload_bytes(
-            owner_wallet,
+            &owner_wallet,
             &id.to_string(),
             version,
             &stored_bytes,
@@ -3105,7 +3092,7 @@ async fn persist_document_record(
         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false,$11,$12)"#,
     )
     .bind(id)
-    .bind(owner_wallet)
+    .bind(&owner_wallet)
     .bind(&hash_hex)
     .bind(&label)
     .bind(file_size)
@@ -3145,13 +3132,19 @@ async fn create_document_record_from_client_envelope(
 ) -> Result<CreatedDocumentRecord, AppError> {
     let mut envelope: DocumentEnvelopeV1 = serde_json::from_slice(envelope_bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid encrypted upload envelope: {e}")))?;
-    let owner_wallet = owner_wallet.to_lowercase();
+    let owner_wallet = normalize_wallet_for_chain(owner_wallet, infer_wallet_chain(owner_wallet));
     if envelope.v != 1 {
         return Err(AppError::BadRequest(
             "Unsupported encrypted upload envelope version".into(),
         ));
     }
-    if envelope.owner.to_lowercase() != owner_wallet {
+    envelope.owner =
+        normalize_wallet_for_chain(&envelope.owner, infer_wallet_chain(&envelope.owner));
+    envelope.encryption.wrapped_keys.iter_mut().for_each(|key| {
+        key.recipient =
+            normalize_wallet_for_chain(&key.recipient, infer_wallet_chain(&key.recipient));
+    });
+    if envelope.owner != owner_wallet {
         return Err(AppError::Forbidden(
             "Encrypted upload envelope owner does not match the active wallet".into(),
         ));
@@ -3172,7 +3165,11 @@ async fn create_document_record_from_client_envelope(
         ));
     }
 
-    let hash_hex = envelope.doc.plaintext_sha3_256_hex.trim().to_ascii_lowercase();
+    let hash_hex = envelope
+        .doc
+        .plaintext_sha3_256_hex
+        .trim()
+        .to_ascii_lowercase();
     let decoded_hash = hex::decode(&hash_hex)
         .map_err(|_| AppError::BadRequest("Encrypted upload hash is not valid hex".into()))?;
     if decoded_hash.len() != 32 {
@@ -3466,11 +3463,18 @@ async fn list_docs_handler(
               where e.doc_id = d.id
                 and e.event_type in ('SIGN', 'ENVELOPE_COMPLETED', 'AGENT_SIGN')
             ) as last_signed_at,
-            case when d.owner_wallet = $1 then 'owned' else 'shared' end as access_kind
+            case when (
+                    ($2 = 'evm' and lower(d.owner_wallet) = lower($1))
+                 or ($2 = 'sol' and d.owner_wallet = $1)
+                 ) then 'owned' else 'shared' end as access_kind
         from documents d
         where d.is_deleted = false
           and (
-            d.owner_wallet = $1
+            (
+              ($2 = 'evm' and lower(d.owner_wallet) = lower($1))
+              or
+              ($2 = 'sol' and d.owner_wallet = $1)
+            )
             or exists (
               select 1
               from document_shares s
@@ -3525,6 +3529,12 @@ async fn list_shared_handler(
     headers: HeaderMap,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let session = require_session_from_headers(&st, &headers).await?;
+    let wallet = normalize_wallet_for_chain(
+        &session.wallet,
+        canonical_chain(&session.chain).unwrap_or_else(|| infer_wallet_chain(&session.wallet)),
+    );
+    let chain =
+        canonical_chain(&session.chain).unwrap_or_else(|| infer_wallet_chain(&session.wallet));
 
     let rows = sqlx::query(
         r#"
@@ -3553,12 +3563,16 @@ async fn list_shared_handler(
             d.version
         from document_shares s
         join documents d on d.id = s.doc_id
-        where s.sender_wallet = $1
+        where (
+                ($2 = 'evm' and lower(s.sender_wallet) = lower($1))
+             or ($2 = 'sol' and s.sender_wallet = $1)
+              )
           and d.is_deleted = false
         order by s.created_at desc
         "#,
     )
-    .bind(session.wallet)
+    .bind(&wallet)
+    .bind(chain)
     .fetch_all(&st.db)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -3623,7 +3637,11 @@ async fn list_shared_activity_handler(
         join documents d on d.id = e.doc_id
         where d.is_deleted = false
           and (
-            d.owner_wallet = $1
+            (
+              ($2 = 'evm' and lower(d.owner_wallet) = lower($1))
+              or
+              ($2 = 'sol' and d.owner_wallet = $1)
+            )
             or exists (
               select 1
               from document_shares s
@@ -3691,10 +3709,14 @@ async fn overview_handler(
             count(*) filter (where is_deleted = false and parent_id is not null) as total_versions,
             count(*) filter (where is_deleted = false and arweave_tx is not null) as anchored_docs
         from documents
-        where owner_wallet = $1
+        where (
+                ($2 = 'evm' and lower(owner_wallet) = lower($1))
+             or ($2 = 'sol' and owner_wallet = $1)
+              )
         "#,
     )
     .bind(&wallet)
+    .bind(chain)
     .fetch_one(&st.db)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -3702,7 +3724,13 @@ async fn overview_handler(
     let share_counts = sqlx::query(
         r#"
         select
-            count(*) filter (where sender_wallet = $1) as total_shares,
+            count(*) filter (
+                where (
+                    ($2 = 'evm' and lower(sender_wallet) = lower($1))
+                    or
+                    ($2 = 'sol' and sender_wallet = $1)
+                )
+            ) as total_shares,
             count(*) filter (
                 where recipient_wallet is not null
                   and status in ('wallet_shared', 'wallet_shared_with_delivery_issues', 'sent', 'created', 'delivery_issue', 'opened')
@@ -3731,13 +3759,17 @@ async fn overview_handler(
         r#"
         select id, label, hash_hex, version, mime_type, arweave_tx, created_at
         from documents
-        where owner_wallet = $1
+        where (
+                ($2 = 'evm' and lower(owner_wallet) = lower($1))
+             or ($2 = 'sol' and owner_wallet = $1)
+              )
           and is_deleted = false
         order by created_at desc
         limit 8
         "#,
     )
     .bind(&wallet)
+    .bind(chain)
     .fetch_all(&st.db)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -3754,12 +3786,16 @@ async fn overview_handler(
             d.label
         from document_events e
         join documents d on d.id = e.doc_id
-        where d.owner_wallet = $1
+        where (
+                ($2 = 'evm' and lower(d.owner_wallet) = lower($1))
+             or ($2 = 'sol' and d.owner_wallet = $1)
+              )
         order by e.created_at desc
         limit 12
         "#,
     )
     .bind(&wallet)
+    .bind(chain)
     .fetch_all(&st.db)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -4686,8 +4722,7 @@ async fn upload_doc_handler(
         )
         .await?
     } else {
-        let mime_type = parsed_mime_type
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let mime_type = parsed_mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
         create_document_record(
             &st,
             &wallet,
@@ -4770,7 +4805,8 @@ async fn create_document_version_handler(
         ));
     }
 
-    let parsed = parse_document_multipart(multipart, "version upload", auto_anchor_enabled()).await?;
+    let parsed =
+        parse_document_multipart(multipart, "version upload", auto_anchor_enabled()).await?;
     let ParsedMultipartUpload {
         file_bytes,
         label: parsed_label,
@@ -4783,7 +4819,8 @@ async fn create_document_version_handler(
         before_hash_hex,
     } = parsed;
 
-    let bytes = file_bytes.ok_or_else(|| AppError::BadRequest("No version file uploaded".into()))?;
+    let bytes =
+        file_bytes.ok_or_else(|| AppError::BadRequest("No version file uploaded".into()))?;
     let label = parsed_label
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -4807,8 +4844,7 @@ async fn create_document_version_handler(
         )
         .await?
     } else {
-        let mime_type = parsed_mime_type
-            .unwrap_or_else(|| parent.mime_type.clone());
+        let mime_type = parsed_mime_type.unwrap_or_else(|| parent.mime_type.clone());
         create_document_record(
             &st,
             &wallet,
@@ -5190,15 +5226,30 @@ async fn delete_doc_handler(
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_session_from_headers(&st, &headers).await?;
-    let wallet = session.wallet.clone();
+    let wallet = normalize_wallet_for_chain(
+        &session.wallet,
+        canonical_chain(&session.chain).unwrap_or_else(|| infer_wallet_chain(&session.wallet)),
+    );
+    let chain =
+        canonical_chain(&session.chain).unwrap_or_else(|| infer_wallet_chain(&session.wallet));
 
-    let result =
-        sqlx::query("update documents set is_deleted = true where id = $1 and owner_wallet = $2")
-            .bind(id)
-            .bind(&wallet)
-            .execute(&st.db)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+    let result = sqlx::query(
+        r#"
+        update documents
+        set is_deleted = true
+        where id = $1
+          and (
+                ($3 = 'evm' and lower(owner_wallet) = lower($2))
+             or ($3 = 'sol' and owner_wallet = $2)
+              )
+        "#,
+    )
+    .bind(id)
+    .bind(&wallet)
+    .bind(chain)
+    .execute(&st.db)
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("Document not found".into()));
@@ -5228,7 +5279,10 @@ async fn share_doc_handler(
     Json(body): Json<ShareRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = require_session_from_headers(&st, &headers).await?;
-    let sender = session.wallet.clone();
+    let sender = normalize_wallet_for_chain(
+        &session.wallet,
+        canonical_chain(&session.chain).unwrap_or_else(|| infer_wallet_chain(&session.wallet)),
+    );
     let sender_chain =
         canonical_chain(&session.chain).unwrap_or_else(|| infer_wallet_chain(&sender));
     let requested_wallet = body
@@ -5254,10 +5308,20 @@ async fn share_doc_handler(
     }
 
     let doc = sqlx::query(
-        "select label, hash_hex from documents where id = $1 and owner_wallet = $2 and is_deleted = false",
+        r#"
+        select label, hash_hex
+        from documents
+        where id = $1
+          and (
+                ($3 = 'evm' and lower(owner_wallet) = lower($2))
+             or ($3 = 'sol' and owner_wallet = $2)
+              )
+          and is_deleted = false
+        "#,
     )
     .bind(doc_id)
     .bind(&sender)
+    .bind(sender_chain)
     .fetch_optional(&st.db)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
