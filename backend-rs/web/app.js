@@ -71,6 +71,19 @@ function authHeaders(extra = {}) {
   return headers;
 }
 
+function normalizeWalletForChain(wallet, chain) {
+  const trimmed = String(wallet || "").trim();
+  const normalizedChain = String(chain || "").trim().toLowerCase();
+  if (!trimmed) return "";
+  if (normalizedChain === "evm" || normalizedChain === "ethereum" || normalizedChain === "metamask") {
+    return trimmed.toLowerCase();
+  }
+  if (!normalizedChain && trimmed.startsWith("0x")) {
+    return trimmed.toLowerCase();
+  }
+  return trimmed;
+}
+
 function getMetaMaskProvider() {
   const injected = window.ethereum;
   if (!injected) return null;
@@ -310,7 +323,10 @@ async function buildClientEncryptedEnvelopeBytes(fileBytes, options = {}) {
   const context = await ensureActiveEncryptionContext();
   const effectiveLabel = options.label || options.fileName || "Untitled document";
   const effectiveMime = options.mimeType || "application/octet-stream";
-  const ownerWallet = String(options.ownerWallet || context.wallet || "").toLowerCase();
+  const ownerWallet = normalizeWalletForChain(
+    options.ownerWallet || context.wallet || "",
+    options.ownerChain || context.chain || ""
+  );
   if (!ownerWallet) {
     throw new Error("Active wallet is unavailable for browser encryption.");
   }
@@ -1325,15 +1341,21 @@ async function uploadDoc() {
       status.innerText = `Encrypted locally. Uploading... ${pct}%`;
     };
 
-    xhr.onload = () => {
+    xhr.onload = async () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         progress.value = 100;
         status.innerText = "Browser-encrypted upload complete";
-        loadDocuments();
         document.getElementById("uploadFile").value = "";
         document.getElementById("uploadLabel").value = "";
         if (document.getElementById("uploadAnchor")) {
           document.getElementById("uploadAnchor").checked = false;
+        }
+        try {
+          await refreshDashboardData();
+        } catch (refreshError) {
+          console.error(refreshError);
+          status.innerText = "Upload complete, but dashboard refresh failed";
+          alert(`Upload completed, but the dashboard refresh failed: ${refreshError.message}`);
         }
       } else {
         progress.value = 0;
