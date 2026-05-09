@@ -1,0 +1,30 @@
+FROM rust:1.87-bookworm AS build
+
+WORKDIR /app
+
+COPY backend-rs/Cargo.toml backend-rs/Cargo.lock ./backend-rs/
+COPY backend-rs/src ./backend-rs/src
+COPY backend-rs/web ./backend-rs/web
+COPY backend-rs/migrations ./backend-rs/migrations
+
+RUN cargo build --manifest-path backend-rs/Cargo.toml --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/backend-rs
+
+COPY --from=build /app/target/release/tidbit /usr/local/bin/tidbit
+COPY --from=build /app/backend-rs/web ./web
+COPY docker/start.sh /usr/local/bin/start.sh
+
+RUN chmod +x /usr/local/bin/tidbit /usr/local/bin/start.sh
+
+ENV PORT=8080
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/start.sh"]
