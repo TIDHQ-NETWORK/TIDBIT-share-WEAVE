@@ -15,16 +15,24 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+RUN useradd --system --create-home --uid 10001 tidbit
+
 WORKDIR /app/backend-rs
 
 COPY --from=build /app/target/release/tidbit /usr/local/bin/tidbit
 COPY --from=build /app/backend-rs/web ./web
 COPY docker/start.sh /usr/local/bin/start.sh
 
-RUN chmod +x /usr/local/bin/tidbit /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/tidbit /usr/local/bin/start.sh \
+    && chown -R tidbit:tidbit /app/backend-rs
 
 ENV PORT=8080
 
 EXPOSE 8080
+
+USER tidbit
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["/bin/sh", "-c", "test -x /usr/local/bin/tidbit && test -d /app/backend-rs/web"]
 
 ENTRYPOINT ["/usr/local/bin/start.sh"]
