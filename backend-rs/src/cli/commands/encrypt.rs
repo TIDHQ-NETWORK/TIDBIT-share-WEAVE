@@ -1,7 +1,6 @@
 // src/cli/commands/encrypt.rs
 
 use crate::crypto::aes_gcm;
-use crate::pqc::kyber; // or your hybrid wrapper
 
 pub async fn encrypt_file(path: &str) -> anyhow::Result<()> {
     let bytes = std::fs::read(path)?;

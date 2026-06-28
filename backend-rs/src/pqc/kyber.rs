@@ -1,7 +1,7 @@
 // src/pqc/kyber.rs
 
-use pqcrypto_mlkem::mlkem1024;
-use pqcrypto_traits::kem::{PublicKey, SecretKey};
+use fips203::ml_kem_1024;
+use fips203::traits::{KeyGen, SerDes};
 
 #[derive(Debug, Clone)]
 pub struct KyberKeypair {
@@ -10,9 +10,10 @@ pub struct KyberKeypair {
 }
 
 pub fn generate_keypair() -> KyberKeypair {
-    let (pk, sk) = mlkem1024::keypair();
+    let (ek, dk) = ml_kem_1024::KG::try_keygen()
+        .expect("ML-KEM key generation should succeed with the default RNG");
     KyberKeypair {
-        public_key: pk.as_bytes().to_vec(),
-        secret_key: sk.as_bytes().to_vec(),
+        public_key: ek.into_bytes().to_vec(),
+        secret_key: dk.into_bytes().to_vec(),
     }
 }
