@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   secureci:
-    uses: TIDHQ-NETWORK/TID-SecureCI/.github/workflows/tid-secureci.yml@a7ed4afaaa8e67d0de0b5d3ea80351ae711ca898
+    uses: TIDHQ-NETWORK/TID-SecureCI/.github/workflows/tid-secureci.yml@a618032d7204771a9a22db25e92047ba14b643c1
     secrets: inherit
     with:
       enforce: true
