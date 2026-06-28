@@ -1,8 +1,8 @@
 //src/crypto/canonical/kem.rs
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use pqcrypto_mlkem::mlkem768;
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
+use fips203::ml_kem_768;
+use fips203::traits::{Decaps, Encaps, KeyGen, SerDes};
 
 #[derive(Debug, Clone)]
 pub struct MlKemKeypair {
@@ -12,11 +12,12 @@ pub struct MlKemKeypair {
 
 /// Generate ML-KEM-768 keypair (base64, URL-safe, no padding)
 pub fn mlkem_generate_keypair_b64() -> MlKemKeypair {
-    let (pk, sk) = mlkem768::keypair();
+    let (ek, dk) = ml_kem_768::KG::try_keygen()
+        .expect("ML-KEM key generation should succeed with the default RNG");
 
     MlKemKeypair {
-        pk_b64: URL_SAFE_NO_PAD.encode(pk.as_bytes()),
-        sk_b64: URL_SAFE_NO_PAD.encode(sk.as_bytes()),
+        pk_b64: URL_SAFE_NO_PAD.encode(ek.into_bytes()),
+        sk_b64: URL_SAFE_NO_PAD.encode(dk.into_bytes()),
     }
 }
 
@@ -26,24 +27,20 @@ pub fn mlkem_encapsulate_b64(recipient_pk_b64: &str) -> Result<(String, Vec<u8>)
         .decode(recipient_pk_b64)
         .map_err(|e| format!("pk decode failed: {e}"))?;
 
-    let pk = mlkem768::PublicKey::from_bytes(&pk_bytes)
+    let pk_array: [u8; ml_kem_768::EK_LEN] = pk_bytes
+        .try_into()
+        .map_err(|_| "invalid mlkem public key length".to_string())?;
+
+    let ek = ml_kem_768::EncapsKey::try_from_bytes(pk_array)
         .map_err(|_| "invalid mlkem public key bytes".to_string())?;
 
-    // ✅ CORRECT ORDER
-    let (ss, ct) = mlkem768::encapsulate(&pk);
-
-    let expected = mlkem768::ciphertext_bytes();
-    let actual = ct.as_bytes().len();
-    if actual != expected {
-        return Err(format!(
-            "encapsulate: ciphertext len mismatch (got {}, expected {})",
-            actual, expected
-        ));
-    }
+    let (ss, ct) = ek
+        .try_encaps()
+        .map_err(|_| "mlkem encapsulate failed".to_string())?;
 
     Ok((
-        URL_SAFE_NO_PAD.encode(ct.as_bytes()),
-        ss.as_bytes().to_vec(),
+        URL_SAFE_NO_PAD.encode(ct.into_bytes()),
+        ss.into_bytes().to_vec(),
     ))
 }
 
@@ -57,22 +54,26 @@ pub fn mlkem_decapsulate_b64(owner_sk_b64: &str, ct_b64: &str) -> Result<Vec<u8>
         .decode(ct_b64)
         .map_err(|e| format!("ct decode failed: {e}"))?;
 
-    let expected = mlkem768::ciphertext_bytes();
-    let actual = ct_bytes.len();
-    if actual != expected {
-        return Err(format!(
-            "decapsulate: ciphertext len mismatch (got {}, expected {})",
-            actual, expected
-        ));
-    }
+    let sk_array: [u8; ml_kem_768::DK_LEN] = sk_bytes
+        .try_into()
+        .map_err(|_| "invalid mlkem secret key length".to_string())?;
 
-    let sk = mlkem768::SecretKey::from_bytes(&sk_bytes)
+    let ct_array: [u8; ml_kem_768::CT_LEN] = ct_bytes.try_into().map_err(|_| {
+        format!(
+            "decapsulate: ciphertext len mismatch (expected {})",
+            ml_kem_768::CT_LEN
+        )
+    })?;
+
+    let dk = ml_kem_768::DecapsKey::try_from_bytes(sk_array)
         .map_err(|_| "invalid mlkem secret key bytes".to_string())?;
 
-    let ct = mlkem768::Ciphertext::from_bytes(&ct_bytes)
+    let ct = ml_kem_768::CipherText::try_from_bytes(ct_array)
         .map_err(|_| "invalid mlkem ciphertext bytes".to_string())?;
 
-    let ss = mlkem768::decapsulate(&ct, &sk);
+    let ss = dk
+        .try_decaps(&ct)
+        .map_err(|_| "mlkem decapsulate failed".to_string())?;
 
-    Ok(ss.as_bytes().to_vec())
+    Ok(ss.into_bytes().to_vec())
 }
