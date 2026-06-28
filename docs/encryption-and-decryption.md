@@ -1,8 +1,74 @@
 # Encryption And Decryption
 
-This document explains the exact encryption, decryption, signing, and anchoring paths that exist in the current codebase.
+This document has two audiences. The first half is a **plain-English primer** for anyone — including people who have never studied cryptography — so you can understand *what* the app protects and *why* it uses "quantum-safe" cryptography. The second half is the **precise technical reference** that auditors and engineers use to verify the exact paths in the codebase.
 
-It is intended to answer four review questions:
+If you only want the deep technical detail, jump to [For Reviewers: Four Questions This Doc Answers](#for-reviewers-four-questions-this-doc-answers).
+
+---
+
+## Start Here: The Whole Idea In One Picture
+
+Imagine you want to put a document in a safe so that only certain people can ever open it.
+
+1. You lock the **document** inside a strong box with a single key. (This is fast and works for files of any size.)
+2. You then make a **copy of that one key for each authorized person**, and lock each copy inside a tiny personal lockbox that only that specific person can open.
+3. You store the strong box and all the tiny lockboxes together.
+
+To read the document, an authorized person opens *their* tiny lockbox, takes out the key copy, and uses it to open the big box. Nobody else's lockbox helps them — and the big box itself is useless without a key.
+
+That is exactly how this app works. The "strong box" is the encrypted file, the "single key" is called the **Content Encryption Key (CEK)**, and the "tiny personal lockboxes" are created using **post-quantum cryptography**. This pattern has a name: **envelope encryption**.
+
+This two-layer design is why the system can share one document with many people *without* re-encrypting the whole file for each person — it just adds one more tiny lockbox.
+
+## The Three Building Blocks (In Plain Words)
+
+Cryptography here is built from three different tools, each doing a job the others can't:
+
+| Tool in this app | Job | Everyday analogy |
+| --- | --- | --- |
+| **XChaCha20-Poly1305** (a *symmetric cipher*) | Scrambles the actual document bytes with one secret key. Fast, handles large files. | The lock on the big strong box. |
+| **ML-KEM** (a *key encapsulation mechanism*) | Lets someone lock a secret *for* you using only your **public** key, so only your **private** key can unlock it. | Each person's tiny personal lockbox. |
+| **ML-DSA** (a *digital signature*) | Lets someone prove "I, the holder of this key, approved this exact document" — and lets anyone verify it. | A tamper-evident wax seal / signature. |
+
+"Symmetric" means the *same* secret key locks and unlocks (good for speed, bad for sharing — how do you give someone the key safely?). "Public-key" tools like ML-KEM and ML-DSA solve the sharing problem: you can hand out a public key to the whole world, and it only ever lets people *lock things for you* or *check your signatures* — never impersonate you or read your mail.
+
+Two supporting helpers also appear:
+- **HKDF-SHA256** turns the raw shared secret produced by ML-KEM into a clean, fixed-size wrapping key. (Think: standardizing a rough key blank into one that fits the lock precisely.)
+- **SHA3-256** produces a "fingerprint" (hash) of the original file — a short, unique value used as custody evidence to prove a file hasn't changed.
+
+## What "Quantum-Safe" Means And Why This Project Cares
+
+Most encryption on the internet today (RSA, elliptic-curve / ECC) is secure only because certain math problems are too slow for normal computers to solve. A large enough **quantum computer** running **Shor's algorithm** would solve exactly those problems quickly — breaking RSA and ECC.
+
+That matters *today*, even though big quantum computers don't exist yet, because of **"harvest now, decrypt later"**: an attacker can copy encrypted data now and simply wait. If the data was protected only by RSA/ECC, a future quantum computer could decrypt the stored copy years later. For documents that must stay confidential for a long time, that is a real risk.
+
+The defense is **post-quantum cryptography (PQC)**: algorithms whose underlying math is believed to be hard *even for quantum computers*. In 2024 the U.S. standards body **NIST** finalized the first PQC standards, and this project uses two of them:
+
+- **ML-KEM** — standardized as **FIPS 203** (formerly known as "Kyber"). Replaces the key-exchange/key-wrapping job that RSA/ECC used to do. This app uses **ML-KEM-768** for documents.
+- **ML-DSA** — standardized as **FIPS 204** (formerly known as "Dilithium"). Replaces RSA/ECC digital signatures. This app uses **ML-DSA-65**.
+
+A common question: *aren't symmetric ciphers also at risk?* Quantum computers (via Grover's algorithm) only **halve** the effective strength of a symmetric cipher. A 256-bit key like the one XChaCha20-Poly1305 uses still leaves ~128 bits of post-quantum security, which is considered safe. So only the **public-key** parts needed replacing — which is precisely what ML-KEM and ML-DSA do.
+
+## A Walk-Through, No Jargon
+
+**Saving (encrypting) a document:**
+1. A random one-time key (the CEK) is generated.
+2. The document is locked with that key using XChaCha20-Poly1305 → this is the big strong box.
+3. For each authorized recipient, ML-KEM uses *their public key* to produce a shared secret; HKDF turns it into a wrapping key; that wrapping key locks a copy of the CEK → one tiny lockbox per person.
+4. The strong box plus all the lockboxes are bundled into a single signed JSON file called the **envelope**, and stored.
+
+**Opening (decrypting) a document:**
+1. The system finds *your* lockbox inside the envelope.
+2. ML-KEM uses your **private** key to recover the same shared secret; HKDF rebuilds the wrapping key; that opens your lockbox and reveals the CEK.
+3. The CEK opens the big strong box, revealing the original document — but only after access-control checks pass.
+
+Both the browser and the backend use the **same** ML-KEM-768 implementation (the pure-Rust `fips203` crate), so a document encrypted in the browser decrypts on the server and vice-versa. The rest of this document describes exactly *where* each step runs (browser vs. backend), *who* holds which keys, and *what* gets recorded as evidence.
+
+---
+
+## For Reviewers: Four Questions This Doc Answers
+
+The remainder is the precise reference for the encryption, decryption, signing, and anchoring paths that exist in the current codebase. It answers:
 
 1. Where is plaintext created and where is it exposed?
 2. What is encrypted in the browser versus on the backend?
@@ -125,7 +191,8 @@ These are separate:
 
 Used for document envelope key wrapping.
 
-- current storage path: ML-KEM-768
+- current storage path: ML-KEM-768 (FIPS 203)
+- implementation: pure-Rust `fips203` crate on both the browser (wasm) and backend paths
 - purpose: protect the CEK used for document payload encryption
 - browser path: encapsulation in wasm
 - backend path: decapsulation on download/review

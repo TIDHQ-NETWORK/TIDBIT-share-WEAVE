@@ -20,6 +20,8 @@ The prior `rsa` issue was mitigated by removing the umbrella `sqlx` crate from t
 
 The prior `paste` warning was mitigated by replacing `pqcrypto-mldsa` with the maintained `fips204` ML-DSA implementation. The current dependency graph audits cleanly.
 
+The ML-KEM envelope path was then migrated off the now-unmaintained `pqcrypto-mlkem`/`pqcrypto-traits` crates (the upstream PQClean project is being archived; `RUSTSEC-2026-0161`, `RUSTSEC-2026-0162`, `RUSTSEC-2026-0163`) to the maintained pure-Rust `fips203` implementation, so the browser and backend now share one ML-KEM implementation. In the same pass `quinn-proto` was bumped to 0.11.15 (`RUSTSEC-2026-0185`). `cargo audit` reports 0 vulnerabilities and 0 warnings.
+
 ## Why This Matters
 
 This folder is not just a snapshot of one command. It documents engineering progress.
@@ -51,6 +53,16 @@ It now uses:
 - `fips204` for ML-DSA signing and verification
 
 That matters because the previous graph included an unmaintained dependency warning under the PQ signing path.
+
+### Step 3: PQ Encryption (KEM) Dependency Cleanup
+
+The backend no longer depends on `pqcrypto-mlkem` or `pqcrypto-traits` for the document envelope path.
+
+It now uses:
+
+- `fips203` for ML-KEM-768 key generation, encapsulation, and decapsulation (and ML-KEM-1024 keygen)
+
+That matters because the `pqcrypto-*` crates became unmaintained when the upstream PQClean project began archiving (`RUSTSEC-2026-0161/0162/0163`). The browser/wasm path already used `fips203`, so this aligns the backend with the browser on a single ML-KEM implementation. `fips203` emits the same standard FIPS 203 byte encodings, so existing stored envelopes, keys, and ciphertexts remain valid with no data migration — verified by the `fips203_browser_encapsulation_decapsulates_on_server_path` cross-compatibility test.
 
 ## How To Review Audit State
 
