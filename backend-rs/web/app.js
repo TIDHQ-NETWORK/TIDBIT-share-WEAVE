@@ -15,9 +15,16 @@ let ownedDocumentsCache = [];
 let agentsCache = [];
 let pqWorkerPromise = null;
 let mammothLoaderPromise = null;
+// Holds the decrypted ML-DSA keypair for the current page session only.
+// The secret key is never persisted in cleartext; it lives here in memory
+// after the passphrase unlock so signing does not re-prompt every operation.
+let pqUnlockedKeypair = null;
 
 const PQ_KEY_STORAGE = "TIDBIT_PQ_MLDSA65_KEYPAIR_V1";
 const PQ_BACKUP_VERSION = 1;
+const PQ_AT_REST_SCHEME = "pbkdf2-sha256-aes-gcm-v1";
+const PQ_KDF_ITERATIONS = 310000;
+const PQ_PASSPHRASE_MIN_LENGTH = 8;
 const CLIENT_ENCRYPTED_UPLOAD_MODE = "browser_pq_envelope_v1";
 const CLIENT_ENCRYPTED_STORAGE_MODE = "pq_envelope_browser_encrypted";
 const CEK_WRAP_INFO = "tidbit-cek-wrap-v1";
@@ -182,30 +189,166 @@ async function pqKeyFingerprint(publicKeyB64) {
   return digest.slice(0, 16);
 }
 
-function loadStoredPqKeypair() {
+// Returns the stored record (encrypted secret + cleartext public metadata) or
+// null. The public key, algorithm, and timestamp stay in cleartext because they
+// are not secret; only the ML-DSA secret key is encrypted at rest. Also accepts
+// the legacy cleartext format so existing devices can be migrated on unlock.
+function loadStoredPqRecord() {
   try {
     const raw = localStorage.getItem(PQ_KEY_STORAGE);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (
-      parsed?.algorithm !== "pq_mldsa65" ||
-      typeof parsed?.public_key_b64 !== "string" ||
-      typeof parsed?.secret_key_b64 !== "string"
-    ) {
+    if (parsed?.algorithm !== "pq_mldsa65" || typeof parsed?.public_key_b64 !== "string") {
       return null;
     }
+    const hasEncryptedSecret = typeof parsed?.secret_ciphertext_b64 === "string";
+    const hasLegacySecret = typeof parsed?.secret_key_b64 === "string";
+    if (!hasEncryptedSecret && !hasLegacySecret) return null;
     return parsed;
   } catch (_) {
     return null;
   }
 }
 
-function saveStoredPqKeypair(keypair) {
-  localStorage.setItem(PQ_KEY_STORAGE, JSON.stringify(keypair));
+function promptPqPassphrase(message) {
+  const value = window.prompt(message || "Enter your ML-DSA key passphrase:");
+  if (value === null) throw new Error("Passphrase entry was cancelled.");
+  if (!value) throw new Error("A passphrase is required to unlock the ML-DSA key.");
+  return value;
+}
+
+function promptNewPqPassphrase(message) {
+  const passphrase = window.prompt(message || "Set a passphrase to protect this device's ML-DSA key:");
+  if (passphrase === null) throw new Error("Passphrase entry was cancelled.");
+  if (passphrase.length < PQ_PASSPHRASE_MIN_LENGTH) {
+    throw new Error(`Passphrase must be at least ${PQ_PASSPHRASE_MIN_LENGTH} characters.`);
+  }
+  const confirmation = window.prompt("Re-enter the passphrase to confirm:");
+  if (confirmation === null) throw new Error("Passphrase confirmation was cancelled.");
+  if (confirmation !== passphrase) throw new Error("Passphrases did not match.");
+  return passphrase;
+}
+
+async function derivePqWrapKey(passphrase, saltBytes) {
+  if (!crypto?.subtle) {
+    throw new Error("WebCrypto is unavailable; cannot protect the ML-DSA key on this browser.");
+  }
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(passphrase),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", hash: "SHA-256", salt: saltBytes, iterations: PQ_KDF_ITERATIONS },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptPqSecret(secretKeyB64, passphrase) {
+  const salt = randomBytes(16);
+  const iv = randomBytes(12);
+  const wrapKey = await derivePqWrapKey(passphrase, salt);
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    wrapKey,
+    new TextEncoder().encode(secretKeyB64)
+  );
+  return {
+    enc: PQ_AT_REST_SCHEME,
+    kdf_iterations: PQ_KDF_ITERATIONS,
+    salt_b64: bytesToBase64(salt),
+    iv_b64: bytesToBase64(iv),
+    secret_ciphertext_b64: bytesToBase64(new Uint8Array(ciphertext)),
+  };
+}
+
+async function decryptPqSecret(record, passphrase) {
+  const wrapKey = await derivePqWrapKey(passphrase, base64ToBytes(record.salt_b64));
+  let plaintext;
+  try {
+    plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64ToBytes(record.iv_b64) },
+      wrapKey,
+      base64ToBytes(record.secret_ciphertext_b64)
+    );
+  } catch (_) {
+    throw new Error("Incorrect passphrase for the browser-local ML-DSA key.");
+  }
+  return new TextDecoder().decode(plaintext);
+}
+
+// Encrypts the secret key under a passphrase-derived AES-GCM key and persists
+// only the ciphertext (plus public metadata). Caches the unlocked keypair in
+// memory for the rest of the session.
+async function saveStoredPqKeypair(keypair, passphrase) {
+  const encrypted = await encryptPqSecret(keypair.secret_key_b64, passphrase);
+  const createdAt = keypair.created_at || new Date().toISOString();
+  const version = keypair.version || PQ_BACKUP_VERSION;
+  const record = {
+    algorithm: "pq_mldsa65",
+    version,
+    created_at: createdAt,
+    public_key_b64: keypair.public_key_b64,
+    ...encrypted,
+  };
+  localStorage.setItem(PQ_KEY_STORAGE, JSON.stringify(record));
+  pqUnlockedKeypair = {
+    algorithm: "pq_mldsa65",
+    version,
+    created_at: createdAt,
+    public_key_b64: keypair.public_key_b64,
+    secret_key_b64: keypair.secret_key_b64,
+  };
+  return record;
+}
+
+// Returns the full keypair (including the secret key) for the current session,
+// prompting for the passphrase on first use. Transparently migrates any legacy
+// cleartext record to the encrypted format.
+async function unlockStoredPqKeypair() {
+  if (pqUnlockedKeypair) return pqUnlockedKeypair;
+
+  const record = loadStoredPqRecord();
+  if (!record) {
+    throw new Error("No device-local ML-DSA key is available.");
+  }
+
+  if (typeof record.secret_key_b64 === "string") {
+    const passphrase = promptNewPqPassphrase(
+      "Set a passphrase to encrypt the existing ML-DSA key stored on this device:"
+    );
+    await saveStoredPqKeypair(
+      {
+        version: record.version,
+        created_at: record.created_at,
+        public_key_b64: record.public_key_b64,
+        secret_key_b64: record.secret_key_b64,
+      },
+      passphrase
+    );
+    return pqUnlockedKeypair;
+  }
+
+  const passphrase = promptPqPassphrase("Enter the passphrase for this device's ML-DSA signing key:");
+  const secretKeyB64 = await decryptPqSecret(record, passphrase);
+  pqUnlockedKeypair = {
+    algorithm: "pq_mldsa65",
+    version: record.version || PQ_BACKUP_VERSION,
+    created_at: record.created_at || new Date().toISOString(),
+    public_key_b64: record.public_key_b64,
+    secret_key_b64: secretKeyB64,
+  };
+  return pqUnlockedKeypair;
 }
 
 function clearStoredPqKeypair() {
   localStorage.removeItem(PQ_KEY_STORAGE);
+  pqUnlockedKeypair = null;
 }
 
 async function getPqWorker() {
@@ -419,6 +562,9 @@ async function generateBrowserPqKeypair() {
   const generated = await callPqWorker("generateKeypair", {
     seed_b64: randomBase64(32),
   });
+  const passphrase = promptNewPqPassphrase(
+    "Set a passphrase to protect this device's new ML-DSA signing key:"
+  );
   const keypair = {
     algorithm: "pq_mldsa65",
     version: PQ_BACKUP_VERSION,
@@ -426,15 +572,12 @@ async function generateBrowserPqKeypair() {
     public_key_b64: generated.public_key_b64,
     secret_key_b64: generated.secret_key_b64,
   };
-  saveStoredPqKeypair(keypair);
+  await saveStoredPqKeypair(keypair, passphrase);
   return keypair;
 }
 
 async function signWithStoredPqKey(message) {
-  const keypair = loadStoredPqKeypair();
-  if (!keypair) {
-    throw new Error("No device-local ML-DSA key is available.");
-  }
+  const keypair = await unlockStoredPqKeypair();
 
   const signed = await callPqWorker("signMessage", {
     secret_key_b64: keypair.secret_key_b64,
@@ -470,10 +613,7 @@ function buildPqBackupPayload(keypair) {
 }
 
 async function exportStoredPqKeypair() {
-  const keypair = loadStoredPqKeypair();
-  if (!keypair) {
-    throw new Error("No device-local ML-DSA key is available.");
-  }
+  const keypair = await unlockStoredPqKeypair();
   const fingerprint = await pqKeyFingerprint(keypair.public_key_b64);
   downloadJsonFile(`tidbit-pq-mldsa65-${fingerprint}.json`, buildPqBackupPayload(keypair));
 }
@@ -504,13 +644,18 @@ async function importStoredPqKeypair(file) {
     throw new Error("The imported ML-DSA backup failed verification.");
   }
 
-  saveStoredPqKeypair({
-    algorithm: "pq_mldsa65",
-    version: parsed.version || PQ_BACKUP_VERSION,
-    created_at: parsed.created_at || new Date().toISOString(),
-    public_key_b64: parsed.public_key_b64,
-    secret_key_b64: parsed.secret_key_b64,
-  });
+  const passphrase = promptNewPqPassphrase(
+    "Set a passphrase to protect the imported ML-DSA key on this device:"
+  );
+  await saveStoredPqKeypair(
+    {
+      version: parsed.version || PQ_BACKUP_VERSION,
+      created_at: parsed.created_at || new Date().toISOString(),
+      public_key_b64: parsed.public_key_b64,
+      secret_key_b64: parsed.secret_key_b64,
+    },
+    passphrase
+  );
 }
 
 async function signTextWithActiveWallet(message) {
@@ -2188,7 +2333,7 @@ async function renderPqStatus(config, { clearSignature = true } = {}) {
   const signatureField = document.getElementById(config.signatureId);
   const exportBtn = document.getElementById(config.exportBtnId);
   const clearBtn = document.getElementById(config.clearBtnId);
-  const keypair = loadStoredPqKeypair();
+  const keypair = loadStoredPqRecord();
 
   if (publicKeyField) {
     publicKeyField.value = keypair?.public_key_b64 || "";
